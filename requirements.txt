@@ -1,0 +1,6 @@
+torch
+transformers
+pypdf
+pillow
+numpy
+google-genai
