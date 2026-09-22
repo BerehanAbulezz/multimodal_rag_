@@ -6,10 +6,14 @@ the SAME space, which is what makes cross-modal retrieval (text query ->
 image results, image query -> text results) possible.
 
 Note: depending on the installed `transformers` version,
-`model.get_text_features(...)` / `get_image_features(...)` either return a
-plain tensor (older versions) or a ModelOutput object such as
-BaseModelOutputWithPooling (newer versions). `_extract_features` below
-handles both cases instead of assuming one.
+`model.get_text_features(...)` / `get_image_features(...)` can return:
+  (a) a plain tensor, already projected - older versions, or
+  (b) a ModelOutput with an already-projected `text_embeds`/`image_embeds`
+      field - some newer versions, or
+  (c) a ModelOutput with only a raw `pooler_output` that still needs to be
+      passed through `model.text_projection` / `model.visual_projection`.
+`_extract_features` below tries (a), then (b), then falls back to (c),
+instead of assuming a single fixed shape.
 """
 import torch
 from PIL import Image
@@ -30,15 +34,21 @@ def _load():
     return _model, _processor
 
 
-def _extract_features(output, projection):
-    """Return a plain (batch, dim) tensor whether `output` already is one,
-    or is a ModelOutput we need to pool + project ourselves."""
+def _extract_features(output, embeds_attr: str, projection):
+    """Return a plain (batch, dim) tensor of ALREADY-PROJECTED features."""
+    # (a) already a tensor - assume it's already projected
     if torch.is_tensor(output):
         return output
+
+    # (b) ModelOutput already carries the projected embedding
+    embeds = getattr(output, embeds_attr, None)
+    if embeds is not None:
+        return embeds
+
+    # (c) fall back: pool + project manually
     pooled = getattr(output, "pooler_output", None)
     if pooled is None:
-        # ModelOutput behaves like a tuple: (last_hidden_state, pooler_output, ...)
-        pooled = output[1]
+        pooled = output[1]  # ModelOutput behaves like a tuple
     return projection(pooled)
 
 
@@ -50,7 +60,7 @@ def embed_text(texts):
     ).to(DEVICE)
     with torch.no_grad():
         raw = model.get_text_features(**inputs)
-        feats = _extract_features(raw, model.text_projection)
+        feats = _extract_features(raw, "text_embeds", model.text_projection)
     feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
     return feats.cpu().numpy()
 
@@ -67,6 +77,6 @@ def embed_image(images):
     inputs = processor(images=pil_images, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
         raw = model.get_image_features(**inputs)
-        feats = _extract_features(raw, model.visual_projection)
+        feats = _extract_features(raw, "image_embeds", model.visual_projection)
     feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
     return feats.cpu().numpy()
