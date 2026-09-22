@@ -11,11 +11,18 @@ until `max_retries` is used up. The last attempt is always returned, with
 a `warning` flag if it never passed grading.
 """
 from . import config
+from .captioning import generate_caption
 from .generator import build_context_block, build_prompt, generate_answer
 
 GRADER_PROMPT_TEMPLATE = """You are a strict grader for a retrieval-augmented QA system.
 Given a question, the retrieved context, and a generated answer, decide whether
-the answer is fully supported by the context AND actually answers the question.
+the answer is BOTH:
+  (a) fully supported by the context (no unsupported claims), AND
+  (b) reasonably complete - it actually addresses every part of the question,
+      not just part of it. If the answer says information is missing for a
+      part of the question that a typical context of this type usually does
+      cover (e.g. an "interesting fact" about an animal), grade it "incorrect"
+      so the system can retry with broader retrieval.
 Respond with exactly one word: "correct" or "incorrect". Do not explain.
 
 Question: {query}
@@ -49,6 +56,30 @@ def rewrite_query(query: str) -> str:
     return interaction.output_text.strip()
 
 
+def _hybrid_image_retrieve(retriever, image, question: str, top_k: int):
+    """
+    Pure image-embedding retrieval tends to return other photos of the same
+    animal (visually similar) rather than the topical text entries someone
+    actually wants an answer from. So instead we:
+      1) caption the query image with BLIP,
+      2) run a TEXT search (question + caption) restricted to text items,
+      3) run an IMAGE search restricted to image items (for the visual match),
+    and merge the two result sets.
+    Returns (results, caption).
+    """
+    caption = generate_caption(image)
+    text_query = f"{question}. The image shows: {caption}".strip()
+
+    n_text = max(1, top_k - 1)
+    text_results = retriever.retrieve(
+        text_query, query_type="text", top_k=n_text, item_filter=lambda it: it.type == "text"
+    )
+    image_results = retriever.retrieve(
+        image, query_type="image", top_k=1, item_filter=lambda it: it.type == "image"
+    )
+    return image_results + text_results, caption
+
+
 def corrective_rag_answer(
     query: str,
     retriever,
@@ -71,7 +102,10 @@ def corrective_rag_answer(
     answer, results, context = None, None, None
 
     for attempt in range(max_retries + 1):
-        results = retriever.retrieve(search_input, query_type=query_type, top_k=top_k + attempt)
+        if query_type == "image":
+            results, _caption = _hybrid_image_retrieve(retriever, search_input, query, top_k + attempt)
+        else:
+            results = retriever.retrieve(search_input, query_type=query_type, top_k=top_k + attempt)
         context = build_context_block(results)
         prompt = build_prompt(query, results)
         answer = generate_answer(prompt)
