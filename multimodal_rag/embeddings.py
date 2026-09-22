@@ -5,15 +5,14 @@ Both `embed_text` and `embed_image` return L2-normalized vectors living in
 the SAME space, which is what makes cross-modal retrieval (text query ->
 image results, image query -> text results) possible.
 
-Note: depending on the installed `transformers` version,
-`model.get_text_features(...)` / `get_image_features(...)` can return:
-  (a) a plain tensor, already projected - older versions, or
-  (b) a ModelOutput with an already-projected `text_embeds`/`image_embeds`
-      field - some newer versions, or
-  (c) a ModelOutput with only a raw `pooler_output` that still needs to be
-      passed through `model.text_projection` / `model.visual_projection`.
-`_extract_features` below tries (a), then (b), then falls back to (c),
-instead of assuming a single fixed shape.
+Implementation note: `model.get_text_features(...)` / `get_image_features(...)`
+have an unstable return shape across `transformers` versions (plain tensor
+vs. various ModelOutput variants), which is what caused earlier crashes.
+To avoid depending on that, we call the internal `model.text_model` /
+`model.vision_model` encoders directly and project their `pooler_output`
+ourselves with `model.text_projection` / `model.visual_projection`. That
+internal API has been stable for years and isn't affected by changes to
+the convenience wrappers.
 """
 import torch
 from PIL import Image
@@ -34,24 +33,6 @@ def _load():
     return _model, _processor
 
 
-def _extract_features(output, embeds_attr: str, projection):
-    """Return a plain (batch, dim) tensor of ALREADY-PROJECTED features."""
-    # (a) already a tensor - assume it's already projected
-    if torch.is_tensor(output):
-        return output
-
-    # (b) ModelOutput already carries the projected embedding
-    embeds = getattr(output, embeds_attr, None)
-    if embeds is not None:
-        return embeds
-
-    # (c) fall back: pool + project manually
-    pooled = getattr(output, "pooler_output", None)
-    if pooled is None:
-        pooled = output[1]  # ModelOutput behaves like a tuple
-    return projection(pooled)
-
-
 def embed_text(texts):
     """texts: list[str] -> np.ndarray of shape (N, D), L2-normalized."""
     model, processor = _load()
@@ -59,8 +40,12 @@ def embed_text(texts):
         text=texts, return_tensors="pt", padding=True, truncation=True
     ).to(DEVICE)
     with torch.no_grad():
-        raw = model.get_text_features(**inputs)
-        feats = _extract_features(raw, "text_embeds", model.text_projection)
+        text_outputs = model.text_model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask"),
+        )
+        pooled_output = text_outputs.pooler_output
+        feats = model.text_projection(pooled_output)
     feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
     return feats.cpu().numpy()
 
@@ -76,7 +61,8 @@ def embed_image(images):
             pil_images.append(img.convert("RGB"))
     inputs = processor(images=pil_images, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
-        raw = model.get_image_features(**inputs)
-        feats = _extract_features(raw, "image_embeds", model.visual_projection)
+        vision_outputs = model.vision_model(pixel_values=inputs["pixel_values"])
+        pooled_output = vision_outputs.pooler_output
+        feats = model.visual_projection(pooled_output)
     feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
     return feats.cpu().numpy()
